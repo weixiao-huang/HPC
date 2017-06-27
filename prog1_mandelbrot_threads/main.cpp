@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
 	for (int i = 1; i < argc; i++) {
 		if (i < argc - 1)
 		{
-			if (strcmp(argv[i], "-threads") == 0 || strcmp(argv[i], "t") == 0)
+			if (strcmp(argv[i], "-threads") == 0 || strcmp(argv[i], "-t") == 0)
 			{
 				numThreads = atoi(argv[i + 1]);
 			}
