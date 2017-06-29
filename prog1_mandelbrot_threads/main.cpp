@@ -70,12 +70,12 @@ bool verifyResult (int *gold, int *result, int width, int height) {
     }
 
     return 1;
-}
+-}
 
 int main(int argc, char** argv) {
 
-    const unsigned int width = 1200;
-    const unsigned int height = 800;
+    const unsigned int width = 1280;
+    const unsigned int height = 960;
     const int maxIterations = 256;
     int numThreads = 2;
 
