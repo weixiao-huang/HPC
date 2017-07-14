@@ -1,5 +1,6 @@
 #include <stdio.h>
 
+#include <cmath>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
@@ -11,8 +12,11 @@
 
 #include "CycleTimer.h"
 
+#define DEFAULT_BLOCKS_PER_GRID 256
+
 extern float toBW(int bytes, float sec);
 
+const int threadsPerBlock = 512;
 
 /* Helper function to round up to a power of 2. 
  */
@@ -28,17 +32,46 @@ static inline int nextPow2(int n)
     return n;
 }
 
-void exclusive_scan(int* device_start, int length, int* device_result)
+
+__global__ void exclusive_scan(int* device_start, int length, int* device_result)
 {
     /* Fill in this function with your exclusive scan implementation.
      * You are passed the locations of the input and output in device memory,
-     * but this is host code -- you will need to declare one or more CUDA 
+     * but this is host code -- you will need to declare one or more CUDA
      * kernels (with the __global__ decorator) in order to actually run code
      * in parallel on the GPU.
      * Note you are given the real length of the array, but may assume that
      * both the input and the output arrays are sized to accommodate the next
      * power of 2 larger than the input.
      */
+     for (int twod = 1; twod < length; twod *= 2) {
+        int id = blockDim.x * blockIdx.x + threadIdx.x;
+        int twod1 = twod * 2;
+        int i = id * twod1;
+        while (i < length) {
+            device_result[i + twod1 - 1] += device_result[i + twod - 1];
+            id += blockDim.x * gridDim.x;
+            i = id * twod1;
+        }
+        __syncthreads();
+     }
+
+     device_result[length - 1] = 0;
+     __syncthreads();
+
+     for (int twod = length / 2; twod >= 1; twod /= 2) {
+        int id = blockDim.x * blockIdx.x + threadIdx.x;
+        int twod1 = twod * 2;
+        int i = id * twod1;
+        while (i < length) {
+            int tmp = device_result[i + twod - 1];
+            device_result[i + twod - 1] = device_result[i + twod1 - 1];
+            device_result[i + twod1 - 1] += tmp;
+            id += blockDim.x * gridDim.x;
+            i = id * twod1;
+        }
+        __syncthreads();
+     }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -69,9 +102,14 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     cudaMemcpy(device_result, inarray, (end - inarray) * sizeof(int), 
                cudaMemcpyHostToDevice);
 
+    //int blocksPerGrid = (rounded_length + threadsPerBlock - 1) / threadsPerBlock;
+    int blocksPerGrid = 1;
+    if (blocksPerGrid > DEFAULT_BLOCKS_PER_GRID)
+        blocksPerGrid = DEFAULT_BLOCKS_PER_GRID;
+
     double startTime = CycleTimer::currentSeconds();
 
-    exclusive_scan(device_input, end - inarray, device_result);
+    exclusive_scan<<<blocksPerGrid, threadsPerBlock>>>(device_input, rounded_length, device_result);
 
     // Wait for any work left over to be completed.
     cudaThreadSynchronize();
