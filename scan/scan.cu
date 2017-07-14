@@ -16,7 +16,7 @@
 
 extern float toBW(int bytes, float sec);
 
-const int threadsPerBlock = 512;
+const int threadsPerBlock = 256;
 
 /* Helper function to round up to a power of 2. 
  */
@@ -32,8 +32,31 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void upsweep(int length, int* device_result, int twod) {
+    int id = blockDim.x * blockIdx.x + threadIdx.x;
+    int twod1 = twod * 2;
+    int i = id * twod1;
+    while (i < length) {
+        device_result[i + twod1 - 1] += device_result[i + twod - 1];
+        id += blockDim.x * gridDim.x;
+        i = id * twod1;
+    }
+}
 
-__global__ void exclusive_scan(int* device_start, int length, int* device_result)
+__global__ void downsweep(int length, int* device_result, int twod) {
+    int id = blockDim.x * blockIdx.x + threadIdx.x;
+    int twod1 = twod * 2;
+    int i = id * twod1;
+    while (i < length) {
+        int tmp = device_result[i + twod - 1];
+        device_result[i + twod - 1] = device_result[i + twod1 - 1];
+        device_result[i + twod1 - 1] += tmp;
+        id += blockDim.x * gridDim.x;
+        i = id * twod1;
+    }
+}
+
+void exclusive_scan(int length, int* device_result)
 {
     /* Fill in this function with your exclusive scan implementation.
      * You are passed the locations of the input and output in device memory,
@@ -44,34 +67,20 @@ __global__ void exclusive_scan(int* device_start, int length, int* device_result
      * both the input and the output arrays are sized to accommodate the next
      * power of 2 larger than the input.
      */
-     for (int twod = 1; twod < length; twod *= 2) {
-        int id = blockDim.x * blockIdx.x + threadIdx.x;
-        int twod1 = twod * 2;
-        int i = id * twod1;
-        while (i < length) {
-            device_result[i + twod1 - 1] += device_result[i + twod - 1];
-            id += blockDim.x * gridDim.x;
-            i = id * twod1;
-        }
-        __syncthreads();
-     }
+    int blocksPerGrid = (length + threadsPerBlock - 1) / threadsPerBlock;
+    blocksPerGrid = 1;
+    if (blocksPerGrid > DEFAULT_BLOCKS_PER_GRID)
+        blocksPerGrid = DEFAULT_BLOCKS_PER_GRID;
 
-     device_result[length - 1] = 0;
-     __syncthreads();
+    for (int twod = 1; twod < length; twod *= 2)
+        upsweep<<<blocksPerGrid, threadsPerBlock>>>(length, device_result, twod);
 
-     for (int twod = length / 2; twod >= 1; twod /= 2) {
-        int id = blockDim.x * blockIdx.x + threadIdx.x;
-        int twod1 = twod * 2;
-        int i = id * twod1;
-        while (i < length) {
-            int tmp = device_result[i + twod - 1];
-            device_result[i + twod - 1] = device_result[i + twod1 - 1];
-            device_result[i + twod1 - 1] += tmp;
-            id += blockDim.x * gridDim.x;
-            i = id * twod1;
-        }
-        __syncthreads();
-     }
+    int zero = 0;
+    cudaMemcpy(device_result + length - 1, &zero, sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    for (int twod = length / 2; twod >= 1; twod /= 2)
+        downsweep<<<blocksPerGrid, threadsPerBlock>>>(length, device_result, twod);
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -102,14 +111,9 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     cudaMemcpy(device_result, inarray, (end - inarray) * sizeof(int), 
                cudaMemcpyHostToDevice);
 
-    //int blocksPerGrid = (rounded_length + threadsPerBlock - 1) / threadsPerBlock;
-    int blocksPerGrid = 1;
-    if (blocksPerGrid > DEFAULT_BLOCKS_PER_GRID)
-        blocksPerGrid = DEFAULT_BLOCKS_PER_GRID;
-
     double startTime = CycleTimer::currentSeconds();
 
-    exclusive_scan<<<blocksPerGrid, threadsPerBlock>>>(device_input, rounded_length, device_result);
+    exclusive_scan(rounded_length, device_result);
 
     // Wait for any work left over to be completed.
     cudaThreadSynchronize();
@@ -151,6 +155,23 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void get_mask(int* device_input, int length, int* mask) {
+    int id = blockDim.x * blockIdx.x + threadIdx.x;
+    while (id < length - 1) {
+        mask[id] = device_input[id] == device_input[id + 1] ? 1 : 0;
+        id += blockDim.x * gridDim.x;
+    }
+}
+
+__global__ void cuda_find_repeats(int* device_start, int length, int* prefix_sum, int* device_output) {
+    int id = blockDim.x * blockIdx.x + threadIdx.x;
+    while (id < length - 1) {
+        if (prefix_sum[id] != prefix_sum[id + 1])
+            device_output[prefix_sum[id]] = device_start[id];
+        id += blockDim.x * gridDim.x;
+    }
+}
+
 int find_repeats(int *device_input, int length, int *device_output) {
     /* Finds all pairs of adjacent repeated elements in the list, storing the
      * indices of the first element of each pair (in order) into device_result.
@@ -162,8 +183,25 @@ int find_repeats(int *device_input, int length, int *device_output) {
      * of 2 in size, so you can use your exclusive_scan function with them if 
      * it requires that. However, you must ensure that the results of
      * find_repeats are correct given the original length.
-     */    
-    return 0;
+     */
+    int blocksPerGrid = (length + threadsPerBlock - 1) / threadsPerBlock;
+    blocksPerGrid = 1;
+    if (blocksPerGrid > DEFAULT_BLOCKS_PER_GRID)
+        blocksPerGrid = DEFAULT_BLOCKS_PER_GRID;
+
+    int *prefix_sum;
+    cudaMalloc((void **)&prefix_sum, length * sizeof(int));
+
+    get_mask<<<blocksPerGrid, threadsPerBlock>>>(device_input, length, prefix_sum);
+
+    exclusive_scan(length, prefix_sum);
+
+    int result = prefix_sum[length - 1]
+
+    cuda_find_repeats<<<blocksPerGrid, threadsPerBlock>>>(device_input, length, prefix_sum, device_output);
+
+    cudaFree(prefix_sum);
+    return result;
 }
 
 /* Timing wrapper around find_repeats. You should not modify this function.
@@ -179,7 +217,7 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
 
     double startTime = CycleTimer::currentSeconds();
     
-    int result = find_repeats(device_input, length, device_output);
+    int result = find_repeats(device_input, rounded_length, device_output);
 
     cudaThreadSynchronize();
     double endTime = CycleTimer::currentSeconds();
